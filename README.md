@@ -1,53 +1,176 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# esp32_Seven_Sement_Clock
 
-# Hello World Example
+The code lives on the **branch**:
+https://github.com/ritesh006/esp32-timekeeper.git
 
-Starts a FreeRTOS task to print "Hello World".
+# ESP32 Clock — UART (12-hour) + TM1637 (HH:MM, blinking colon) via NTP (IST)
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+This branch turns an ESP32 into a tidy wall/desk clock:
 
-## How to use example
+- Connects to Wi-Fi (STA) and syncs time via **SNTP** in **immediate** mode (no smooth drift).
+- Waits for sync before showing anything (so you never see a wrong time).
+- Prints **12-hour time** with seconds on **UART** (single-line refresh).
+- Shows **HH:MM** on a **TM1637 4-digit** 7-segment with a **blinking colon**.
 
-Follow detailed instructions provided specifically for this example.
+> Target timezone: **Asia/Kolkata (IST)**.
 
-Select the instructions depending on Espressif chip installed on your development board:
+---
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+## Hardware
 
+- **ESP32** DevKit (ESP32-WROOM/ESP32-DevKitC)
+- **TM1637 4-digit** display module
 
-## Example folder contents
+### Wiring
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
+| TM1637 Pin | ESP32 Pin | Notes                                                              |
+|------------|-----------|--------------------------------------------------------------------|
+| VCC        | 5V        | 5V for good brightness (3.3V also works on many modules)          |
+| GND        | GND       | Common ground                                                      |
+| DIO        | GPIO16    | Configurable in code                                               |
+| CLK        | GPIO17    | Configurable in code                                               |
 
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
+> TM1637 modules typically tolerate 3.3V logic even on 5V VCC (most have on-board resistors). If your module is unusual, power at 3.3V.
 
-Below is short explanation of remaining files in the project folder.
+---
+
+## What you’ll see
+
+- **USB serial (UART0)** @ **115200 bps**: `hh:mm:ss AM/PM dd-mm-YYYY IST` (refreshed on one line).
+- **TM1637**: `HH:MM` (12-hour). The **colon blinks** every second.
+
+---
+
+## Project Layout (relevant files)
 
 ```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+main/
+  ├─ main.c          // Wi-Fi STA + SNTP (IST) + UART + TM1637 update loop
+  ├─ tm1637.c        // Minimal bit-banged TM1637 driver
+  ├─ tm1637.h
+  └─ CMakeLists.txt  // Lists main.c + tm1637.c
+CMakeLists.txt        // Top-level: includes $IDF_PATH/tools/cmake/project.cmake
+sdkconfig.defaults    // Optional defaults (stack size, flash size)
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+---
+
+## Quick Start
+
+### 1) Configure Wi-Fi and display pins
+
+Edit **`main/main.c`**:
+
+```c
+#define WIFI_SSID "YOUR_SSID"
+#define WIFI_PASS "WIFI_PASS"
+
+#define TM_DIO_PIN     GPIO_NUM_16
+#define TM_CLK_PIN     GPIO_NUM_17
+#define TM_BRIGHTNESS  7   // 0..7
+```
+
+### 2) Windows quick build (ESP-IDF v5.3.x, VS Code)
+
+> **Recommended clean-restart flow** (fixes the `MSys/Mingw is no longer supported` error).
+
+1. **Close ALL** VS Code windows.  
+2. Launch **VS Code from the Start menu** (do **not** open from Git Bash).  
+3. Open the repo folder (root with `CMakeLists.txt`).  
+4. Command Palette → **ESP-IDF: Open ESP-IDF Terminal**.  
+5. In that terminal, run:
+   ```powershell
+   idf.py set-target esp32
+   idf.py fullclean
+   idf.py build
+   idf.py flash monitor
+   ```
+
+> If you still see the MSYS message, clear MSYS env vars in that terminal and reload ESP-IDF env:
+> ```powershell
+> Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
+> Remove-Item Env:MSYS2_PATH_TYPE -ErrorAction SilentlyContinue
+> Remove-Item Env:CHERE_INVOKING -ErrorAction SilentlyContinue
+> & "$HOME\.vscode\extensions\espressif.esp-idf-extension-1.10.2\export.ps1"
+> idf.py build
+> ```
+
+**CLI alternative (outside VS Code):**
+```bash
+idf.py set-target esp32
+idf.py fullclean
+idf.py build flash monitor
+```
+
+> Serial monitor default: **115200** baud.
+
+---
+
+## Important SDK settings
+
+Open **menuconfig** (VS Code → *SDK Configuration Editor*):
+
+1. **Event loop stack** (prevents `sys_evt` stack overflow):
+   - `Component config → Event loop library → Event loop task stack size` → **4096** (or **6144** if needed)
+
+2. **Flash size** (fixes “Detected 4096k larger than header 2048k”):
+   - `Serial flasher config → Flash size` → **4 MB (4096 kB)`
+   - Then `Full Clean` → Build → Flash  
+   - If still mismatched once, do `ESP-IDF: Erase Flash` and flash again
+
+> Persist defaults via optional **`sdkconfig.defaults`**:
+> ```
+> CONFIG_ESP_EVENT_LOOP_TASK_STACK_SIZE=4096
+> CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+> ```
+
+---
+
+## How time sync works (and why it looks instant)
+
+- SNTP servers: `pool.ntp.org`, `time.cloudflare.com`, `time.google.com`
+- **Immediate mode** is enabled → the system clock is set at once (no slow slewing).
+- The app **waits** for `SNTP_SYNC_STATUS_COMPLETED` before it prints/displays time.
+
+---
+
+## Customization
+
+- **24-hour display** (TM1637): change the hour fed into the TM1637 call:
+  ```c
+  // Instead of h12, use ti.tm_hour (00..23)
+  tm1637_show_hhmm((uint8_t)ti.tm_hour, (uint8_t)ti.tm_min, colon);
+  ```
+- **Quieter logs** after sync (keeps UART line clean):
+  ```c
+  // after time sync OK
+  esp_log_level_set("*", ESP_LOG_WARN);
+  ```
+- **Extra NTP sources**: add more `esp_sntp_setservername(index, "host")`.
+
+---
 
 ## Troubleshooting
 
-* Program upload failure
+- **Access denied / COM port busy**:
+  - Close other serial apps/monitors (Arduino, PuTTY, prior Monitor tabs).
+  - Unplug/replug USB. Reopen **Monitor** with only one instance.
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+- **Stack overflow in `sys_evt` or event loop**:
+  - Increase **Event loop task stack size** to **4096–6144** in menuconfig.
 
-## Technical support and feedback
+- **Flash size mismatch**:
+  - Set **Flash size = 4 MB** in menuconfig, `Full Clean`, Build, Flash.  
+  - If persistent once, run **Erase Flash** then Flash.
 
-Please use the following feedback channels:
+- **NTP doesn’t sync** (stuck on “Waiting for NTP…”):
+  - Ensure your Wi-Fi has internet and UDP/123 isn’t blocked.
+  - Try a different AP or mobile hotspot temporarily to verify.
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
+- **Python requirements error** (ESP-IDF tools):
+  - Run **`install.bat`** for your ESP-IDF version or VS Code command  
+    **“ESP-IDF: Install ESP-IDF Python Packages”** targeting v5.3.1.
 
-We will get back to you as soon as possible.
+---
+
+**License:** same as repository’s root (or add one here if needed).

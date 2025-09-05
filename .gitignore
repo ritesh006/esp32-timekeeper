@@ -3,6 +3,8 @@
 /.vscode/
 /managed_components/
 /.idea/
+/__pycache__/
+/.pytest_cache/
 *.log
 *.map
 *.elf

@@ -72,3 +72,4 @@ void tm1637_show_hhmm(uint8_t hh, uint8_t mm, bool colon)
     if (colon) s1 |= 0x80;                 // colon bit on digit1
     show4(s0, s1, s2, s3);
 }
+
