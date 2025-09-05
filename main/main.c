@@ -1,179 +1,143 @@
-// main.c — ESP-IDF (v5.x)
-// Presence-based attendance timer using ESP32 SoftAP + TM1637 (HH:MM).
-// DIO = GPIO16, CLK = GPIO17 (see tm1637_init call).
-// Build: add tm1637.c/h to your component (see CMakeLists snippet below).
+// main.c — ESP-IDF v5.3.x
+// Wi-Fi STA + SNTP (immediate apply) → UART single-line time + TM1637 HH:MM
 
 #include <stdio.h>
 #include <string.h>
-#include <stdbool.h>
-#include <inttypes.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "esp_log.h"
-#include "esp_err.h"
-#include "esp_event.h"
-#include "esp_netif.h"
 #include "esp_wifi.h"
-#include "esp_timer.h"
+#include "esp_event.h"
 #include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_log.h"
 
-#include "tm1637.h"
+#include "esp_sntp.h"          // use ONLY this (do NOT include lwip/apps/sntp.h)
+#include "tm1637.h"            // your TM1637 driver
 
-static const char *TAG = "attendance";
+// ====== Configure these ======
+#define WIFI_SSID "Airtel_123"
+#define WIFI_PASS "Ritesh@123"
 
-// ====== CONFIG ======
-#define AP_SSID           "OFFICE_ATTENDANCE"
-#define AP_PASS           "12345678"
-#define AP_CHANNEL        6
-#define AP_MAX_CONN       2
-#define TM_BRIGHTNESS     7              // 0..7
-#define TM_DIO_PIN        GPIO_NUM_16
-#define TM_CLK_PIN        GPIO_NUM_17
+// TM1637 pins/brightness
+#define TM_DIO_PIN     GPIO_NUM_16
+#define TM_CLK_PIN     GPIO_NUM_17
+#define TM_BRIGHTNESS  7   // 0..7
 
-// Target: 9h15m = 33300 seconds
-#define TARGET_SECONDS    (9*3600 + 15*60)
+static const char *TAG = "clock";
 
-// OPTIONAL allow-list: set to your phone's MAC to lock to one device.
-// Leave as all zeros to accept ANY device as presence trigger.
-static uint8_t ALLOW_MAC[6] = {0,0,0,0,0,0};
-
-// ====== STATE ======
-static volatile bool     s_session_active   = false;
-static volatile int64_t  s_session_start_us = 0;
-static volatile uint32_t s_session_accum_s  = 0;
-// If no allow MAC configured, we use station count to gate start/stop
-static volatile int      s_sta_count        = 0;
-
-// ====== HELPERS ======
-static inline void session_start(void) {
-    if (!s_session_active) {
-        s_session_active   = true;
-        s_session_start_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "SESSION START");
-    }
-}
-
-static inline void session_stop(void) {
-    if (s_session_active) {
-        int64_t delta_s = (esp_timer_get_time() - s_session_start_us) / 1000000;
-        if (delta_s > 0) s_session_accum_s += (uint32_t)delta_s;
-        s_session_active = false;
-        ESP_LOGI(TAG, "SESSION STOP, accum=%us", (unsigned)s_session_accum_s);
-    }
-}
-
-static bool mac_allowed(const uint8_t mac[6]) {
-    static const uint8_t ZERO[6] = {0};
-    if (memcmp(ALLOW_MAC, ZERO, 6) == 0) return true;         // no filter
-    return memcmp(ALLOW_MAC, mac, 6) == 0;                    // filter set
-}
-
-static void log_mac(const char *prefix, const uint8_t mac[6]) {
-    ESP_LOGI(TAG, "%s %02X:%02X:%02X:%02X:%02X:%02X",
-             prefix, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-}
-
-// ====== WIFI AP & EVENTS ======
-static void wifi_ap_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)data;
-        log_mac("STA CONNECTED:", e->mac);
-        if (!mac_allowed(e->mac)) return;
-
-        if (memcmp(ALLOW_MAC, (uint8_t[6]){0}, 6) == 0) {
-            // accept any device: count stations
-            s_sta_count++;
-            if (s_sta_count == 1) session_start();
-        } else {
-            // allow-list mode: start only for the allowed MAC
-            session_start();
-        }
-    }
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)data;
-        log_mac("STA DISCONNECTED:", e->mac);
-        if (!mac_allowed(e->mac)) return;
-
-        if (memcmp(ALLOW_MAC, (uint8_t[6]){0}, 6) == 0) {
-            if (s_sta_count > 0) s_sta_count--;
-            if (s_sta_count == 0) session_stop();
-        } else {
-            session_stop();
-        }
-    }
-}
-
-static void wifi_init_softap(void)
-{
+// ---------- Wi-Fi (STA) ----------
+static void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    wifi_config_t ap = {0};
-    strcpy((char*)ap.ap.ssid, AP_SSID);
-    strcpy((char*)ap.ap.password, AP_PASS);
-    ap.ap.ssid_len       = 0;
-    ap.ap.channel        = AP_CHANNEL;
-    ap.ap.max_connection = AP_MAX_CONN;
-    ap.ap.authmode       = WIFI_AUTH_WPA_WPA2_PSK;
+    wifi_config_t wifi_config = {0};
+    strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+    strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,   &wifi_ap_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, &wifi_ap_handler, NULL));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "SoftAP ready. SSID:%s PASS:%s CH:%d", AP_SSID, AP_PASS, AP_CHANNEL);
+    ESP_LOGI(TAG, "Connecting to WiFi...");
+    ESP_ERROR_CHECK(esp_wifi_connect());
 }
 
-// ====== APP ======
-void app_main(void)
-{
-    // Keep UART single-line updates immediate
+// simple polling until associated (for production, register IP_EVENT_STA_GOT_IP)
+static void wait_for_ip_simple(void) {
+    for (int i = 0; i < 100; ++i) {           // ~20s max
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// ---------- SNTP (IST, immediate set) ----------
+static void on_time_sync(struct timeval *tv) {
+    ESP_LOGI("sntp", "Time synchronized");
+}
+
+static void sntp_init_ist(void) {
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.cloudflare.com");
+    esp_sntp_setservername(2, "time.google.com");
+
+    // Apply time immediately (no smoothing)
+    sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+
+    // Use NTP server from DHCP if router provides one (IDF 5.3: this is the available API)
+    sntp_servermode_dhcp(1);   // <-- changed back to this
+
+    esp_sntp_set_time_sync_notification_cb(on_time_sync);
+    esp_sntp_init();
+
+    // IST timezone: POSIX sign is inverted for TZ (+5:30 => "IST-5:30")
+    setenv("TZ", "IST-5:30", 1);
+    tzset();
+}
+
+void app_main(void) {
+    // Make printf unbuffered so our single-line UI is responsive
     setvbuf(stdout, NULL, _IONBF, 0);
 
     ESP_ERROR_CHECK(nvs_flash_init());
-    wifi_init_softap();
+    wifi_init_sta();
+    wait_for_ip_simple();
+    sntp_init_ist();
 
-    // Optional: quiet logs to keep UART line clean after boot
-    // esp_log_level_set("*", ESP_LOG_WARN);
+    // Wait until SNTP reports completion (or 30s timeout)
+    bool synced = false;
+    for (int i = 0; i < 30; ++i) {
+        if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) { synced = true; break; }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-    // Init 4-digit TM1637
+    // Also check the calendar year looks sane
+    time_t now = 0;
+    struct tm ti = {0};
+    time(&now);
+    localtime_r(&now, &ti);
+    if (!synced || ti.tm_year < (2016 - 1900)) {
+        ESP_LOGW(TAG, "SNTP not ready yet; holding display until sync.");
+    }
+
+    // Init TM1637 display (HH:MM)
     tm1637_init(TM_DIO_PIN, TM_CLK_PIN, TM_BRIGHTNESS);
 
-    // Main loop: update display + single-line UART every second
+    // Optional: quiet logs so they don't break the single-line UART clock
+    // esp_log_level_set("*", ESP_LOG_WARN);
+
     while (1) {
-        // Compute elapsed seconds
-        uint32_t elapsed_s = s_session_accum_s;
-        if (s_session_active) {
-            int64_t now_us = esp_timer_get_time();
-            elapsed_s += (uint32_t)((now_us - s_session_start_us) / 1000000);
+        time(&now);
+        localtime_r(&now, &ti);
+
+        // If not yet synced, keep waiting (don't show wrong time)
+        if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && ti.tm_year < (2016 - 1900)) {
+            tm1637_show_hhmm(0, 0, false);
+            printf("\r\x1b[KWaiting for NTP...");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
         }
 
-        uint32_t hh = elapsed_s / 3600;
-        uint32_t mm = (elapsed_s % 3600) / 60;
-        if (hh > 99) hh = 99; // 2-digit cap
+        // --- SYNCED: display the real time ---
+        int h12 = ti.tm_hour % 12; if (h12 == 0) h12 = 12;
+        bool colon = (ti.tm_sec % 2) == 0;
 
-        // TM1637: show HH:MM; blink colon while running
-        bool colon = s_session_active ? ((elapsed_s % 2) == 0) : false;
-        tm1637_show_hhmm((uint8_t)hh, (uint8_t)mm, colon);
+        // TM1637: 12-hour HH:MM with blinking colon
+        tm1637_show_hhmm((uint8_t)h12, (uint8_t)ti.tm_min, colon);
 
-        // UART single-line status
-        char line[80];
-        snprintf(line, sizeof(line), "%02u:%02u elapsed%s%s",
-                 (unsigned)hh, (unsigned)mm,
-                 s_session_active ? " (RUN)" : " (STOP)",
-                 (elapsed_s >= TARGET_SECONDS) ? "  ✅ 9:15 reached" : "");
-
-        // \r = return to start; ESC[K clears to end of line
-        printf("\r\x1b[K%s", line);
+        // UART: single-line 12-hour time with seconds + date + IST tag
+        char buf[64];
+        strftime(buf, sizeof(buf), "%I:%M:%S %p %d-%m-%Y IST", &ti);
+        printf("\r\x1b[K%s", buf);
         fflush(stdout);
 
         vTaskDelay(pdMS_TO_TICKS(1000));
