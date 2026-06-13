@@ -172,5 +172,3 @@ Open **menuconfig** (VS Code → *SDK Configuration Editor*):
     **“ESP-IDF: Install ESP-IDF Python Packages”** targeting v5.3.1.
 
 ---
-
-**License:** same as repository’s root (or add one here if needed).
